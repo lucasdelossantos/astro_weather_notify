@@ -1,0 +1,14 @@
+services:
+  astro-notify:
+    build: .
+    environment:
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL}
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN}
+      - DISCORD_GUILD_ID=${DISCORD_GUILD_ID}
+      - LATITUDE=${LATITUDE}
+      - LONGITUDE=${LONGITUDE}
+      - ELEVATION=${ELEVATION}
+      - TIMEZONE=${TIMEZONE}
+      - LOCATION_NAME=${LOCATION_NAME}
+      - TZ=${TIMEZONE}
+    restart: unless-stopped
