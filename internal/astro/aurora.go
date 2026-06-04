@@ -31,49 +31,39 @@ func FetchAuroraForecast() (*AuroraForecast, error) {
 		return nil, fmt.Errorf("noaa kp returned %d", resp.StatusCode)
 	}
 
-	// Response is a JSON array of arrays: [["time_tag", "Kp", "observed/predicted"], ...]
-	var raw [][]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+	type kpEntry struct {
+		TimeTag  string  `json:"time_tag"`
+		Kp       float64 `json:"kp"`
+		Observed string  `json:"observed"`
+	}
+
+	var entries []kpEntry
+	if err := json.NewDecoder(resp.Body).Decode(&entries); err != nil {
 		return nil, fmt.Errorf("noaa kp decode failed: %w", err)
 	}
 
-	if len(raw) < 2 {
-		return nil, fmt.Errorf("noaa kp: insufficient data")
+	if len(entries) == 0 {
+		return nil, fmt.Errorf("noaa kp: no data")
 	}
 
 	forecast := &AuroraForecast{}
 	now := time.Now().UTC()
 
-	// Skip header row (index 0), parse remaining
-	for _, row := range raw[1:] {
-		if len(row) < 2 {
-			continue
-		}
-
-		kpVal := parseKpValue(row[1])
-		if kpVal < 0 {
-			continue
-		}
-
-		// Parse time to determine if it's within next 24h
-		timeStr, ok := row[0].(string)
-		if !ok {
-			continue
-		}
-		t, err := time.Parse("2006-01-02 15:04:05.000", timeStr)
+	for _, entry := range entries {
+		t, err := time.Parse("2006-01-02T15:04:05", entry.TimeTag)
 		if err != nil {
 			continue
 		}
 
 		// Find current (closest past entry)
 		if t.Before(now) || t.Equal(now) {
-			forecast.CurrentKp = kpVal
+			forecast.CurrentKp = entry.Kp
 		}
 
 		// Track max in next 24h
 		if t.After(now) && t.Before(now.Add(24*time.Hour)) {
-			if kpVal > forecast.MaxKp24h {
-				forecast.MaxKp24h = kpVal
+			if entry.Kp > forecast.MaxKp24h {
+				forecast.MaxKp24h = entry.Kp
 			}
 		}
 	}
@@ -103,15 +93,3 @@ func FetchAuroraForecast() (*AuroraForecast, error) {
 	return forecast, nil
 }
 
-func parseKpValue(v interface{}) float64 {
-	switch val := v.(type) {
-	case float64:
-		return val
-	case string:
-		var f float64
-		fmt.Sscanf(val, "%f", &f)
-		return f
-	default:
-		return -1
-	}
-}
