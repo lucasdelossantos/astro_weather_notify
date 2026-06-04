@@ -1,2 +1,4 @@
 .env
-astro_weather_notify
+astro-notify
+.claude/
+.cursor/

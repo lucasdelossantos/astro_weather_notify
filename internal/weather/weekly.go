@@ -29,7 +29,7 @@ func FetchWeeklyNights(lat, lon float64, tz string) ([]NightSummary, error) {
 		lat, lon, tz,
 	)
 
-	resp, err := http.Get(url)
+	resp, err := meteoGet(url)
 	if err != nil {
 		return nil, fmt.Errorf("open-meteo weekly request failed: %w", err)
 	}

@@ -10,5 +10,6 @@ services:
       - ELEVATION=${ELEVATION}
       - TIMEZONE=${TIMEZONE}
       - LOCATION_NAME=${LOCATION_NAME}
+      - TOMORROW_API_KEY=${TOMORROW_API_KEY}
       - TZ=${TIMEZONE}
     restart: unless-stopped

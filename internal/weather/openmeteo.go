@@ -5,8 +5,50 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
+
+var meteoClient = &http.Client{Timeout: 30 * time.Second}
+
+var (
+	meteoMu       sync.Mutex
+	meteoLastCall time.Time
+)
+
+const meteoMinInterval = 2 * time.Second
+
+// meteoBackoff tracks when to skip Open-Meteo entirely after repeated 429s.
+var meteoBackoffUntil time.Time
+
+// meteoGet serializes requests, enforces minimum spacing, and retries on 429.
+// After a failure, backs off for 5 minutes to avoid slow fallback paths.
+func meteoGet(url string) (*http.Response, error) {
+	meteoMu.Lock()
+	defer meteoMu.Unlock()
+
+	if time.Now().Before(meteoBackoffUntil) {
+		return nil, fmt.Errorf("open-meteo backed off until %s", meteoBackoffUntil.Format(time.Kitchen))
+	}
+
+	if elapsed := time.Since(meteoLastCall); elapsed < meteoMinInterval {
+		time.Sleep(meteoMinInterval - elapsed)
+	}
+
+	meteoLastCall = time.Now()
+	resp, err := meteoClient.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != http.StatusTooManyRequests {
+		return resp, nil
+	}
+	resp.Body.Close()
+
+	// Single 429 triggers a 5-minute backoff so subsequent calls fail fast
+	meteoBackoffUntil = time.Now().Add(5 * time.Minute)
+	return nil, fmt.Errorf("rate limited, backing off for 5 minutes")
+}
 
 type OpenMeteoResponse struct {
 	Hourly OpenMeteoHourly `json:"hourly"`
@@ -77,7 +119,7 @@ func FetchNighttimeWeather(lat, lon float64, tz string) (*NighttimeWeather, erro
 		lat, lon, tz,
 	)
 
-	resp, err := http.Get(url)
+	resp, err := meteoGet(url)
 	if err != nil {
 		return nil, fmt.Errorf("open-meteo request failed: %w", err)
 	}
@@ -196,7 +238,7 @@ func FetchPressureLevelData(lat, lon float64, tz string) (*PressureLevelResponse
 		lat, lon, tz,
 	)
 
-	resp, err := http.Get(url)
+	resp, err := meteoGet(url)
 	if err != nil {
 		return nil, fmt.Errorf("pressure-level request failed: %w", err)
 	}
@@ -283,7 +325,7 @@ func FetchECMWFData(lat, lon float64, tz string) (*ECMWFResponse, error) {
 		lat, lon, tz,
 	)
 
-	resp, err := http.Get(url)
+	resp, err := meteoGet(url)
 	if err != nil {
 		return nil, fmt.Errorf("ecmwf request failed: %w", err)
 	}
@@ -354,7 +396,7 @@ func FetchAirQuality(lat, lon float64, tz string) (*AirQualityResponse, error) {
 		lat, lon, tz,
 	)
 
-	resp, err := http.Get(url)
+	resp, err := meteoGet(url)
 	if err != nil {
 		return nil, fmt.Errorf("air-quality request failed: %w", err)
 	}

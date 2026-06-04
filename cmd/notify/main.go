@@ -344,9 +344,19 @@ func resolveLocation(i *discordgo.InteractionCreate) locationParams {
 }
 
 func generateReportForLocation(loc locationParams) (*scoring.Report, error) {
+	weatherSource := "Open-Meteo (GFS/ECMWF/CAMS)"
 	wx, err := weather.FetchNighttimeWeather(loc.lat, loc.lon, loc.tz)
 	if err != nil {
-		return nil, fmt.Errorf("open-meteo: %w", err)
+		if cfg.TomorrowAPIKey != "" {
+			log.Printf("open-meteo failed (%v), trying tomorrow.io fallback", err)
+			wx, err = weather.FetchNighttimeWeatherTomorrow(loc.lat, loc.lon, loc.tz, cfg.TomorrowAPIKey)
+			if err != nil {
+				return nil, fmt.Errorf("both open-meteo and tomorrow.io failed: %w", err)
+			}
+			weatherSource = "Tomorrow.io (fallback)"
+		} else {
+			return nil, fmt.Errorf("open-meteo: %w", err)
+		}
 	}
 
 	// Fetch pressure-level data for cloud thickness estimation
@@ -401,6 +411,7 @@ func generateReportForLocation(loc locationParams) (*scoring.Report, error) {
 
 	report := scoring.Generate(wx, astroWx, moon, planets)
 	report.Aurora = aurora
+	report.WeatherSource = weatherSource
 	return report, nil
 }
 

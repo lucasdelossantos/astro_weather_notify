@@ -16,6 +16,7 @@ type Config struct {
 	Timezone          string
 	LocationName      string
 	CronSchedule      string
+	TomorrowAPIKey    string
 }
 
 func Load() (*Config, error) {
@@ -39,6 +40,7 @@ func Load() (*Config, error) {
 		Timezone:          envString("TIMEZONE", "America/New_York"),
 		LocationName:      envString("LOCATION_NAME", "Goshen, MA"),
 		CronSchedule:      envString("CRON_SCHEDULE", "0 16 * * *"),
+		TomorrowAPIKey:    envString("TOMORROW_API_KEY", ""),
 	}
 
 	return cfg, nil

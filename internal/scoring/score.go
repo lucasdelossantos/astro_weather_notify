@@ -39,6 +39,7 @@ type Report struct {
 	IWV            float64
 	AOD            float64
 	Visibility     float64
+	WeatherSource  string
 }
 
 // CloudThickness represents the estimated vertical extent of high clouds.

@@ -130,7 +130,7 @@ func BuildEmbed(report *scoring.Report, locationName string) Embed {
 		Fields:    fields,
 		Timestamp: now.Format(time.RFC3339),
 		Footer: Footer{
-			Text: "Data: Open-Meteo (GFS/ECMWF/CAMS), 7Timer, USNO, VisiblePlanets",
+			Text: fmt.Sprintf("Data: %s, 7Timer, USNO, VisiblePlanets", report.WeatherSource),
 		},
 	}
 }

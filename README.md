@@ -33,19 +33,24 @@ Cloud thickness is estimated by counting how many pressure levels (300, 250, 200
 
 ## Data Sources
 
-All free, no API keys required:
+Primary sources are free with no API keys. Tomorrow.io (optional) provides resilience when Open-Meteo is unavailable.
 
-| Source | Data |
-|--------|------|
-| Open-Meteo Forecast (GFS) | Cloud cover by layer, visibility, humidity, temperature, wind, precipitation |
-| Open-Meteo Pressure Levels (GFS) | Cloud cover and RH at 300/250/200/150 hPa, jet stream wind |
-| Open-Meteo ECMWF | Total column integrated water vapor |
-| Open-Meteo Air Quality (CAMS) | Aerosol optical depth at 550nm |
-| 7Timer | Astronomical seeing and transparency (supplementary) |
-| USNO | Moon phase, illumination, rise/set, twilight times |
-| VisiblePlanets API | Planets above the horizon tonight |
-| NOAA SWPC | Kp index for aurora forecast |
-| In-The-Sky.org | Astronomical events calendar |
+| Source | Data | Key Required |
+|--------|------|:---:|
+| Open-Meteo Forecast (GFS) | Cloud cover by layer, visibility, humidity, temperature, wind, precipitation | No |
+| Open-Meteo Pressure Levels (GFS) | Cloud cover and RH at 300/250/200/150 hPa, jet stream wind | No |
+| Open-Meteo ECMWF | Total column integrated water vapor | No |
+| Open-Meteo Air Quality (CAMS) | Aerosol optical depth at 550nm | No |
+| Tomorrow.io | Fallback weather data (cloud cover, wind, humidity, precip) | Yes (free tier) |
+| 7Timer | Astronomical seeing and transparency (supplementary) | No |
+| USNO | Moon phase, illumination, rise/set, twilight times | No |
+| VisiblePlanets API | Planets above the horizon tonight | No |
+| NOAA SWPC | Kp index for aurora forecast | No |
+| In-The-Sky.org | Astronomical events calendar | No |
+
+### Fallback Behavior
+
+When Open-Meteo returns a rate-limit error (429), the system automatically falls back to Tomorrow.io if a key is configured. A circuit breaker skips Open-Meteo for 5 minutes after a failure to keep response times fast. The embed footer indicates which data source was used. Tomorrow.io provides total cloud cover only (no low/mid/high layer split), so the scoring uses estimated layer distribution when running on the fallback.
 
 ## Discord Commands
 
@@ -63,6 +68,7 @@ All free, no API keys required:
 - Go 1.23+
 - A Discord bot token (for slash commands)
 - A Discord webhook URL (for scheduled notifications)
+- A Tomorrow.io API key (optional, free tier at https://www.tomorrow.io/weather-api/)
 
 ### Configuration
 
@@ -78,6 +84,7 @@ ELEVATION=444
 TIMEZONE=America/New_York
 LOCATION_NAME=Goshen, MA
 CRON_SCHEDULE=0 16 * * *               # 4PM daily
+TOMORROW_API_KEY=your-key              # optional, fallback weather source
 ```
 
 ### Run Locally
@@ -102,6 +109,7 @@ cmd/notify/main.go          Entry point, Discord bot, cron scheduler
 internal/
   weather/
     openmeteo.go            Open-Meteo forecast + pressure-level + ECMWF + CAMS
+    tomorrow.go             Tomorrow.io fallback weather source
     seventimer.go           7Timer astronomical conditions
     weekly.go               7-day nightly summaries
   scoring/
