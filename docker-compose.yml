@@ -11,5 +11,9 @@ services:
       - TIMEZONE=${TIMEZONE}
       - LOCATION_NAME=${LOCATION_NAME}
       - TOMORROW_API_KEY=${TOMORROW_API_KEY}
+      - NOTIFY_THRESHOLD=${NOTIFY_THRESHOLD:-6.0}
+      - PROFILE_PATH=/app/profile.json
       - TZ=${TIMEZONE}
+    volumes:
+      - ./profile.json:/app/profile.json:ro
     restart: unless-stopped

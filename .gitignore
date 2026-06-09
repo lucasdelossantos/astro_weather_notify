@@ -1,4 +1,5 @@
 .env
 astro-notify
+profile.json
 .claude/
 .cursor/

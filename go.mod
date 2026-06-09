@@ -1,4 +1,4 @@
-module github.com/ldelossa/astro_weather_notify
+module github.com/lucasdelossantos/astro_weather_notify
 
 go 1.23
 

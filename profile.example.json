@@ -1,0 +1,33 @@
+{
+  "rigs": [
+    {
+      "name": "Nikon D3500 (Untracked)",
+      "type": "untracked-dslr",
+      "camera": "Nikon D3500",
+      "tracked": false,
+      "lenses": [
+        {"focal_length_mm": 18, "aperture": 3.5, "name": "18-55mm kit (wide end)"},
+        {"focal_length_mm": 55, "aperture": 5.6, "name": "18-55mm kit (tele end)"},
+        {"focal_length_mm": 70, "aperture": 4.5, "name": "70-300mm (wide end)"},
+        {"focal_length_mm": 300, "aperture": 6.3, "name": "70-300mm (tele end)"}
+      ],
+      "max_exposure_sec": 25,
+      "sensor_crop_factor": 1.5
+    },
+    {
+      "name": "Seestar S30 Pro",
+      "type": "smart-telescope",
+      "tracked": true,
+      "aperture_mm": 50,
+      "focal_length_mm": 250,
+      "sensor_crop_factor": 1.0,
+      "integrated_stacking": true,
+      "max_exposure_sec": 600,
+      "fov_degrees": 1.3
+    }
+  ],
+  "site": {
+    "bortle_class": 4,
+    "horizon_obstructions": []
+  }
+}

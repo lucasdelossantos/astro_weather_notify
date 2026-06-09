@@ -4,8 +4,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/ldelossa/astro_weather_notify/internal/astro"
-	"github.com/ldelossa/astro_weather_notify/internal/weather"
+	"github.com/lucasdelossantos/astro_weather_notify/internal/astro"
+	"github.com/lucasdelossantos/astro_weather_notify/internal/config"
+	"github.com/lucasdelossantos/astro_weather_notify/internal/weather"
 )
 
 type Report struct {
@@ -31,7 +32,7 @@ type Report struct {
 	Moon           *astro.MoonInfo
 	MoonImpact     string
 	Planets        []astro.PlanetInfo
-	Targets        []astro.Target
+	Targets        []astro.TargetSuggestion
 	Aurora         *astro.AuroraForecast
 	Recommendation string
 	JetStreamRisk  bool
@@ -50,7 +51,7 @@ type CloudThickness struct {
 }
 
 // Generate produces a full scoring report from weather and astro data.
-func Generate(wx *weather.NighttimeWeather, astroWx *weather.AstroConditions, moon *astro.MoonInfo, planets []astro.PlanetInfo) *Report {
+func Generate(wx *weather.NighttimeWeather, astroWx *weather.AstroConditions, moon *astro.MoonInfo, planets []astro.PlanetInfo, profile *config.Profile) *Report {
 	r := &Report{
 		CloudCoverPct:  wx.AvgCloudCover,
 		CloudCoverLow:  wx.AvgCloudCoverLow,
@@ -87,31 +88,63 @@ func Generate(wx *weather.NighttimeWeather, astroWx *weather.AstroConditions, mo
 	precipScore := scorePrecip(wx.MaxPrecipProb)
 	windScore := scoreWind(wx.AvgWindSpeed)
 
-	// Weighted combination — seeing removed (irrelevant for wide-field DSLR),
-	// cloud opacity and transparency dominate since they are the go/no-go factors.
-	r.Score = cloudScore*0.40 +
-		transScore*0.25 +
-		moonScore*0.15 +
-		humidityScore*0.10 +
-		windScore*0.05 +
-		precipScore*0.05
+	// Weights shift when tracked long-focal-length equipment is present:
+	// seeing becomes relevant for resolving detail at narrow fields of view.
+	if profile.HasTrackedLongFL() {
+		seeingScore := scoreSeeingValue(r.Seeing, astroWx.Available)
+		r.Score = cloudScore*0.35 +
+			transScore*0.20 +
+			seeingScore*0.10 +
+			moonScore*0.15 +
+			humidityScore*0.10 +
+			windScore*0.05 +
+			precipScore*0.05
+		r.SeeingNote = "Seeing affects tracked long-focal-length imaging"
+	} else {
+		r.Score = cloudScore*0.40 +
+			transScore*0.25 +
+			moonScore*0.15 +
+			humidityScore*0.10 +
+			windScore*0.05 +
+			precipScore*0.05
+		r.SeeingNote = "Seeing does not affect wide-field imaging"
+	}
 
 	r.Verdict = verdict(r.Score)
 	r.CloudDesc = cloudDescription(wx.AvgCloudCover)
 	r.SeeingDesc = seeingDescription(r.Seeing)
-	r.SeeingNote = "Seeing does not affect wide-field imaging"
 	r.TransDesc = transparencyDescription(r.IWV, r.AOD, r.Transparency, astroWx.Available)
 	r.DewRiskNote = dewRiskNote(r.DewPointSpread)
 	r.MoonImpact = moonImpactDescription(moon)
-	r.Recommendation = generateRecommendation(r)
+	r.Recommendation = generateRecommendation(r, profile)
 
 	moonIllum := 0.0
 	if moon != nil && moon.Available {
 		moonIllum = moon.Illumination
 	}
-	r.Targets = astro.SuggestTargets(time.Now().Month(), moonIllum, r.Score)
+	r.Targets = astro.SuggestTargets(time.Now().Month(), moonIllum, r.Score, profile)
 
 	return r
+}
+
+func scoreSeeingValue(seeing int, available bool) float64 {
+	if !available {
+		return 5
+	}
+	switch {
+	case seeing <= 2:
+		return 10
+	case seeing <= 3:
+		return 8
+	case seeing <= 4:
+		return 6
+	case seeing <= 5:
+		return 4
+	case seeing <= 6:
+		return 2
+	default:
+		return 0
+	}
 }
 
 // estimateCloudThickness uses pressure-level cloud cover and RH to determine
@@ -422,15 +455,26 @@ func moonImpactDescription(moon *astro.MoonInfo) string {
 	}
 }
 
-func generateRecommendation(r *Report) string {
+func generateRecommendation(r *Report, profile *config.Profile) string {
+	imagingType := "wide-field imaging"
+	if profile.HasTrackedLongFL() && !profile.HasTracking() {
+		imagingType = "wide-field imaging"
+	} else if profile.HasTrackedLongFL() {
+		if profile.MinFocalLength() < 50 {
+			imagingType = "both wide-field and deep-sky imaging"
+		} else {
+			imagingType = "deep-sky imaging"
+		}
+	}
+
 	if r.Score >= 8 {
 		msg := fmt.Sprintf("Clear skies with %s transparency.", r.TransDesc)
 		if r.MoonImpact != "" {
 			msg += fmt.Sprintf(" %s moon impact.", r.MoonImpact)
 		}
-		msg += " Excellent conditions for wide-field imaging."
+		msg += fmt.Sprintf(" Excellent conditions for %s.", imagingType)
 		if r.DewPointSpread < 5 {
-			msg += " Watch for dew on your lens as the night progresses."
+			msg += " Watch for dew on optics as the night progresses."
 		}
 		return msg
 	}
@@ -446,7 +490,7 @@ func generateRecommendation(r *Report) string {
 			msg += " Consider targets away from the moon."
 		}
 		if r.DewPointSpread < 4 {
-			msg += " Dew risk is elevated -- bring a lens cloth."
+			msg += " Dew risk is elevated -- protect optics."
 		}
 		return msg
 	}

@@ -11,15 +11,16 @@ import (
 	"github.com/bwmarrin/discordgo"
 	"github.com/robfig/cron/v3"
 
-	"github.com/ldelossa/astro_weather_notify/internal/astro"
-	"github.com/ldelossa/astro_weather_notify/internal/config"
-	"github.com/ldelossa/astro_weather_notify/internal/discord"
-	"github.com/ldelossa/astro_weather_notify/internal/geo"
-	"github.com/ldelossa/astro_weather_notify/internal/scoring"
-	"github.com/ldelossa/astro_weather_notify/internal/weather"
+	"github.com/lucasdelossantos/astro_weather_notify/internal/astro"
+	"github.com/lucasdelossantos/astro_weather_notify/internal/config"
+	"github.com/lucasdelossantos/astro_weather_notify/internal/discord"
+	"github.com/lucasdelossantos/astro_weather_notify/internal/geo"
+	"github.com/lucasdelossantos/astro_weather_notify/internal/scoring"
+	"github.com/lucasdelossantos/astro_weather_notify/internal/weather"
 )
 
 var cfg *config.Config
+var profile *config.Profile
 
 func main() {
 	var err error
@@ -27,6 +28,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("config error: %v", err)
 	}
+
+	profile = config.LoadProfile()
+	log.Printf("loaded equipment profile: %d rig(s)", len(profile.Rigs))
 
 	// Create Discord bot session
 	session, err := discordgo.New("Bot " + cfg.DiscordBotToken)
@@ -199,9 +203,21 @@ func buildWeekEmbed(nights []weather.NightSummary, locationName string) *discord
 		Timestamp: time.Now().Format(time.RFC3339),
 	}
 
+	// Find the best night
+	bestIdx := 0
+	bestScore := 0.0
+	scores := make([]float64, len(nights))
+	for i, n := range nights {
+		scores[i] = weather.FullScore(n)
+		if scores[i] > bestScore {
+			bestScore = scores[i]
+			bestIdx = i
+		}
+	}
+
 	var description string
-	for _, n := range nights {
-		score := weather.QuickScore(n)
+	for i, n := range nights {
+		score := scores[i]
 		bar := scoreBar(score)
 		dayName := n.Date.Format("Mon Jan 2")
 
@@ -219,7 +235,12 @@ func buildWeekEmbed(nights []weather.NightSummary, locationName string) *discord
 			verdict = "No go"
 		}
 
-		description += fmt.Sprintf("**%s** : %s %.1f/10 - %s\n", dayName, bar, score, verdict)
+		marker := ""
+		if i == bestIdx && bestScore >= 4 {
+			marker = " << BEST NIGHT"
+		}
+
+		description += fmt.Sprintf("**%s** : %s %.1f/10 - %s%s\n", dayName, bar, score, verdict, marker)
 		description += fmt.Sprintf("  Cloud: Low %.0f%% | Mid %.0f%% | High %.0f%% | Wind: %.0f km/h | Precip: %.0f%%\n\n",
 			n.AvgCloudLow, n.AvgCloudMid, n.AvgCloudHigh, n.AvgWindSpeed, n.MaxPrecipProb)
 	}
@@ -409,7 +430,7 @@ func generateReportForLocation(loc locationParams) (*scoring.Report, error) {
 		aurora = nil
 	}
 
-	report := scoring.Generate(wx, astroWx, moon, planets)
+	report := scoring.Generate(wx, astroWx, moon, planets, profile)
 	report.Aurora = aurora
 	report.WeatherSource = weatherSource
 	return report, nil
@@ -430,6 +451,10 @@ func sendWebhookNotification() error {
 	report, err := generateReport()
 	if err != nil {
 		return err
+	}
+	if report.Score < cfg.NotifyThreshold {
+		log.Printf("cron: score %.1f below threshold %.1f, skipping notification", report.Score, cfg.NotifyThreshold)
+		return nil
 	}
 	return discord.Send(cfg.DiscordWebhookURL, report, cfg.LocationName)
 }

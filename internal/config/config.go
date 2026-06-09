@@ -17,6 +17,7 @@ type Config struct {
 	LocationName      string
 	CronSchedule      string
 	TomorrowAPIKey    string
+	NotifyThreshold   float64
 }
 
 func Load() (*Config, error) {
@@ -41,6 +42,7 @@ func Load() (*Config, error) {
 		LocationName:      envString("LOCATION_NAME", "Goshen, MA"),
 		CronSchedule:      envString("CRON_SCHEDULE", "0 16 * * *"),
 		TomorrowAPIKey:    envString("TOMORROW_API_KEY", ""),
+		NotifyThreshold:   envFloat("NOTIFY_THRESHOLD", 6.0),
 	}
 
 	return cfg, nil

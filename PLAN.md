@@ -1,367 +1,262 @@
-# Plan: Rework Forecast Accuracy with Cloud Opacity and Enhanced Data
+# Equipment Profile System
 
 ## Executive Summary
 
-The current scoring system gave a "Good Night to Shoot" verdict on a night with 100% high cloud cover that produced a completely unusable sky (moon glazed over, zero stars visible). The root cause is twofold: (1) high clouds are treated as nearly harmless with no ability to distinguish thin cirrus from thick cirrostratus, and (2) several critical atmospheric quality metrics are either not fetched or not used in scoring. This rework adds cloud thickness estimation via pressure-level vertical profiles, integrates water vapor and aerosol data for transparency assessment, and reweights the scoring to match what actually matters for wide-field astrophotography.
+The bot currently hardcodes equipment assumptions (Nikon D3500, untracked, two kit lenses) throughout the target catalog, scoring weights, and recommendation text. This plan introduces a JSON-based equipment profile that drives target selection, camera settings, and scoring behavior. Adding a new lens or rig becomes a config file edit, not a code change. The immediate concrete addition is the ZWO Seestar S30 Pro (tracked smart telescope).
 
 ## Deep Research Findings
 
-### Current Data Flow
-
-```
-Open-Meteo (single call) -> cloud_cover_{low,mid,high}, visibility, humidity, dew_point, wind, precip
-7Timer                    -> seeing (1-8), transparency (1-8)
-```
-
-### What's Wrong
-
-1. **Cloud opacity is unknown** -- `cloud_cover_high = 100%` tells us the sky is covered but not whether those clouds are thin (tau ~0.1, shootable) or thick (tau >1.0, opaque). The 30% penalty rate assumes all high clouds are thin cirrus.
-
-2. **Visibility is fetched but ignored** -- `AvgVisibility` is stored in `NighttimeWeather` but never used in scoring. Low visibility + high clouds = thick opaque layer. High visibility + high clouds = thin cirrus.
-
-3. **No vertical cloud profile** -- Open-Meteo offers pressure-level cloud cover (300, 250, 200, 150 hPa). Multiple saturated levels = geometrically thick cloud. Single level = thin layer.
-
-4. **No water vapor column** -- Total column integrated water vapor (IWV) from ECMWF directly correlates with atmospheric transparency. <15 kg/m^2 = good, >25 = poor.
-
-5. **No aerosol data** -- Smoke, haze, and particulates destroy contrast for wide-field imaging. CAMS provides aerosol optical depth (AOD) via Open-Meteo's air quality API.
-
-6. **No jet stream awareness** -- Wind speed at 250 hPa indicates jet stream overhead. >30 m/s = high cirrus risk even if current coverage looks clear.
-
-7. **Seeing is overweighted** -- 20% of the score goes to a metric that is irrelevant for wide-field imaging on a DSLR (pixel scale ~30 arcsec/pixel at 18mm).
-
-8. **Dew risk assessment is crude** -- Uses humidity alone, but dew point spread (temp minus dew point) is the real indicator. Without a dew heater, the user is vulnerable at spreads <4C.
-
 ### Dependencies Traced
 
-- `scoring.Generate()` <- called from `cmd/notify/main.go:372`
-- `scoring.Generate()` takes `*weather.NighttimeWeather` and `*weather.AstroConditions`
-- `weather.FetchNighttimeWeather()` <- called from `cmd/notify/main.go:347`
-- `weather.QuickScore()` <- called from `cmd/notify/main.go:205` (weekly embed)
-- `discord.BuildEmbed()` <- reads from `scoring.Report` struct
-- `discord.formatSkyConditions()` <- displays cloud/seeing/transparency/humidity/wind
+- `internal/astro/targets.go` — hardcoded `catalog` slice with `Lens` and `Settings` fields baked for specific glass
+- `internal/scoring/score.go:92-97` — scoring weights assume wide-field untracked (seeing excluded at 0% weight)
+- `internal/scoring/score.go:102` — `SeeingNote` hardcodes "Seeing does not affect wide-field imaging"
+- `internal/scoring/score.go:106` — `generateRecommendation()` references "wide-field imaging"
+- `internal/discord/webhook.go:209-215` — `formatTargets()` renders `Lens` and `Settings` fields
+- `internal/config/config.go` — no equipment fields exist today
+- `cmd/notify/main.go:112` — `SuggestTargets()` call has no equipment context
+- `docker-compose.yml` — would need a volume mount for the profile file
+
+### Call Graph
+
+```
+main.go → scoring.Generate() → astro.SuggestTargets()
+                                    ↓
+                              catalog (hardcoded slice)
+                                    ↓
+                              filtered by month + moon
+```
+
+Scoring weights are static constants in `Generate()`. Recommendations are generated from the report struct with no knowledge of equipment.
+
+### Data Flow
+
+Profile JSON → loaded at startup by config package → passed into scoring.Generate() and astro.SuggestTargets() → drives which targets appear, what settings text is shown, and how the score is weighted.
 
 ### Affected Components
 
-- `internal/weather/openmeteo.go` -- new API calls, new struct fields
-- `internal/weather/weekly.go` -- `QuickScore` uses same broken cloud logic
-- `internal/scoring/score.go` -- complete scoring rework
-- `internal/discord/webhook.go` -- display new metrics (opacity, transparency source, dew spread)
-- `cmd/notify/main.go` -- wire new data fetches into report generation
+1. `internal/config/config.go` — load profile
+2. `internal/astro/targets.go` — filter/annotate targets based on equipment capabilities
+3. `internal/scoring/score.go` — adjust weights based on rig type
+4. `cmd/notify/main.go` — thread profile through to scoring and targets
+5. `internal/discord/webhook.go` — display equipment-aware settings
+6. `docker-compose.yml` — mount profile volume
 
----
+## Design
 
-## Numbered Changes
+### Profile File: `profile.json`
 
-### 1. New Data Source: Pressure-Level Cloud Profile
+A single JSON file mounted into the container. Structure:
 
-**Location:** `internal/weather/openmeteo.go`
-
-**What:** Add a second Open-Meteo request (or extend the existing one) to fetch pressure-level data for cirrus-level altitudes.
-
-**Variables to add:**
-- `cloud_cover_300hPa` (9.2 km -- cirrus base)
-- `cloud_cover_250hPa` (10.4 km -- mid-cirrus)
-- `cloud_cover_200hPa` (11.8 km -- upper cirrus)
-- `cloud_cover_150hPa` (13.6 km -- high cirrus)
-- `relative_humidity_300hPa`
-- `relative_humidity_250hPa`
-- `relative_humidity_200hPa`
-- `wind_speed_250hPa` (jet stream indicator)
-
-**Model:** Use `models=gfs_seamless` since pressure-level data availability varies by model.
-
-**Why:** Counting how many consecutive pressure levels show cloud cover >70% or RH >85% gives a proxy for cloud geometric thickness. 1 level = thin, 3-4 levels = thick/opaque.
-
-### 2. New Data Source: ECMWF Water Vapor Column
-
-**Location:** `internal/weather/openmeteo.go` (new function)
-
-**What:** Fetch `total_column_integrated_water_vapour` from the ECMWF endpoint.
-
-**Endpoint:** `https://api.open-meteo.com/v1/ecmwf?latitude=X&longitude=Y&hourly=total_column_integrated_water_vapour&forecast_days=2&timezone=Z`
-
-**Why:** IWV is the single best predictor of atmospheric transparency from model data. Thresholds:
-- <10 kg/m^2: Excellent transparency
-- 10-15: Good
-- 15-25: Average
-- >25: Poor (hazy even without clouds)
-
-### 3. New Data Source: Aerosol Optical Depth
-
-**Location:** `internal/weather/openmeteo.go` (new function)
-
-**What:** Fetch `aerosol_optical_depth` from the Open-Meteo air quality API.
-
-**Endpoint:** `https://air-quality-api.open-meteo.com/v1/air-quality?latitude=X&longitude=Y&hourly=aerosol_optical_depth&forecast_days=2&timezone=Z`
-
-**Why:** Smoke and haze destroy wide-field contrast. AOD thresholds:
-- <0.05: Excellent
-- 0.05-0.15: Good
-- 0.15-0.30: Noticeable haze
-- >0.30: Poor -- significant extinction
-
-### 4. Compute Cloud Opacity Score
-
-**Location:** `internal/scoring/score.go` (new function)
-
-**What:** Replace the naive `scoreCloudLayers()` with a function that accounts for thickness:
-
-```go
-func scoreCloudOpacity(low, mid, high float64, thickness CloudThickness, visibility float64) float64 {
-    // Low and mid clouds are always opaque -- penalty is straightforward
-    lowScore := 10 * (1 - low/100)
-    midScore := 10 * (1 - mid/100)
-
-    // High cloud penalty scales with estimated opacity
-    highOpacity := estimateHighCloudOpacity(high, thickness, visibility)
-    highScore := 10 * (1 - high/100*highOpacity)
-
-    return lowScore*0.45 + midScore*0.30 + highScore*0.25
-}
-```
-
-The `estimateHighCloudOpacity()` function combines:
-- **Vertical extent** (pressure levels with clouds): 1 level -> opacity factor 0.3, 2 levels -> 0.6, 3+ levels -> 0.9
-- **Visibility cross-check**: if visibility <10km with high clouds, increase opacity estimate
-- **RH saturation depth**: consecutive levels with RH >85% confirms thick cloud
-
-This means 100% high clouds that are thin cirrus (1 level, good visibility) still get a moderate penalty (~0.3 factor), but 100% high clouds that are thick cirrostratus (3+ levels, low visibility) get treated nearly as harshly as mid-layer clouds (~0.9 factor).
-
-### 5. Compute Transparency Score from Physical Data
-
-**Location:** `internal/scoring/score.go` (new function)
-
-**What:** Replace reliance on 7Timer's coarse 1-8 scale with a transparency score derived from IWV + AOD + high cloud opacity:
-
-```go
-func scoreTransparency(iwv float64, aod float64, highCloudOpacity float64, highCover float64, sevenTimerTrans int, sevenTimerAvailable bool) float64 {
-    // Physical model: combine water vapor extinction + aerosol extinction + cloud scatter
-    iwvScore := scoreIWV(iwv)        // 0-10 based on thresholds above
-    aodScore := scoreAOD(aod)        // 0-10 based on thresholds above
-    cloudExtinction := highCloudOpacity * (highCover / 100) * 2.0  // additional scatter from thin clouds
-
-    // Weighted: IWV dominates, AOD secondary, thin cloud scatter tertiary
-    physicalScore := iwvScore*0.50 + aodScore*0.30 - cloudExtinction
-    if physicalScore < 0 {
-        physicalScore = 0
+```json
+{
+  "rigs": [
+    {
+      "name": "Nikon D3500 (Untracked)",
+      "type": "untracked-dslr",
+      "camera": "Nikon D3500",
+      "tracked": false,
+      "lenses": [
+        {"focal_length_mm": 18, "aperture": 3.5, "name": "18-55mm kit (wide end)"},
+        {"focal_length_mm": 55, "aperture": 5.6, "name": "18-55mm kit (tele end)"},
+        {"focal_length_mm": 70, "aperture": 4.5, "name": "70-300mm (wide end)"},
+        {"focal_length_mm": 300, "aperture": 6.3, "name": "70-300mm (tele end)"}
+      ],
+      "max_exposure_sec": 25,
+      "sensor_crop_factor": 1.5
+    },
+    {
+      "name": "Seestar S30 Pro",
+      "type": "smart-telescope",
+      "tracked": true,
+      "aperture_mm": 50,
+      "focal_length_mm": 250,
+      "sensor_crop_factor": 1.0,
+      "integrated_stacking": true,
+      "max_exposure_sec": 600,
+      "fov_degrees": 1.3
     }
-
-    // If 7Timer is available, blend it in as a sanity check (20% weight)
-    if sevenTimerAvailable {
-        sevenTimerScore := 10 * (1 - float64(sevenTimerTrans-1)/7)
-        return physicalScore*0.80 + sevenTimerScore*0.20
-    }
-    return physicalScore
+  ],
+  "site": {
+    "bortle_class": 4,
+    "horizon_obstructions": ["south-low-trees"]
+  }
 }
 ```
 
-**Why:** 7Timer uses GFS at 28km resolution -- coarse and often wrong. Physical parameters (IWV, AOD) from ECMWF and CAMS are more reliable and tell us WHY transparency is bad, not just that it is.
+### How Profile Drives Behavior
 
-### 6. Rework Overall Score Weights
+**Target Selection:**
+- Each target in the catalog gets `min_focal_mm`, `max_focal_mm`, `requires_tracking`, and `angular_size_deg` fields
+- `SuggestTargets()` accepts the profile and filters to targets achievable by at least one rig
+- Settings text is generated dynamically from the matched rig's capabilities (e.g., "Seestar: 10min stack" or "D3500 @ 55mm: 8s, ISO 3200, f/5.6")
+- Rule of 500 computes max shutter for untracked rigs: `500 / (focal_length * crop_factor)`
 
-**Location:** `internal/scoring/score.go`, `Generate()` function
+**Scoring Weights:**
+- If any rig is tracked + focal_length > 100mm: seeing weight increases from 0% to 10% (taken from wind and precip)
+- If all rigs are untracked: current weights preserved
+- Bortle class informs a "light pollution impact" note in recommendations
 
-**Current weights:**
-| Component | Weight |
-|---|---|
-| Cloud layers | 35% |
-| Seeing | 20% |
-| Transparency | 20% |
-| Moon | 15% |
-| Precip | 5% |
-| Wind | 5% |
+**Recommendations:**
+- Text adapts: "wide-field imaging" vs. "deep-sky stacking" vs. "both wide-field and deep-sky" depending on rig mix
+- Dew warnings reference specific equipment (lens cloth for DSLR, Seestar's built-in heater)
 
-**New weights:**
-| Component | Weight | Rationale |
-|---|---|---|
-| Cloud opacity | 40% | Absolute gatekeeper -- if sky is blocked, nothing else matters |
-| Transparency | 25% | Critical for wide-field contrast and limiting magnitude |
-| Moon | 15% | Hard constraint for deep-sky/Milky Way |
-| Humidity/Dew | 10% | Equipment risk without dew heater; also degrades transparency |
-| Wind | 5% | Tripod stability at longer focal lengths |
-| Precip | 5% | Equipment safety |
+### New Target Catalog Entries (Seestar-class)
 
-**Seeing is removed from the score.** It is still fetched and displayed as informational (useful if you get a tracked scope later), but it does not affect the go/no-go number because wide-field imaging is unaffected by seeing under ~10 arcsec.
+These require tracking and longer focal lengths:
 
-### 7. Add Humidity/Dew Score
+| Target | Type | Months | FL Range | Requires Dark | Angular Size |
+|--------|------|--------|----------|---------------|--------------|
+| Andromeda Galaxy (M31) | galaxy | 8-12 | 50-300mm | Yes | 3.0 deg |
+| Orion Nebula (M42) detail | nebula | 11-3 | 150-500mm | No | 1.0 deg |
+| Dumbbell Nebula (M27) | nebula | 6-10 | 150-500mm | Yes | 0.13 deg |
+| Ring Nebula (M57) | nebula | 6-10 | 200-500mm | Yes | 0.04 deg |
+| Whirlpool Galaxy (M51) | galaxy | 3-6 | 200-500mm | Yes | 0.19 deg |
+| Lagoon Nebula (M8) | nebula | 6-8 | 100-300mm | Yes | 1.5 deg |
+| Trifid Nebula (M20) | nebula | 6-8 | 150-300mm | Yes | 0.5 deg |
+| Eagle Nebula (M16) | nebula | 6-8 | 150-300mm | Yes | 0.6 deg |
+| Hercules Cluster (M13) | cluster | 5-9 | 150-500mm | No | 0.33 deg |
+| Wild Duck Cluster (M11) | cluster | 6-9 | 100-300mm | No | 0.23 deg |
+| North America Nebula (NGC 7000) | nebula | 6-10 | 50-200mm | Yes | 2.0 deg |
+| Bode's Galaxy (M81/M82) | galaxy | 11-5 | 200-500mm | Yes | 0.4 deg |
 
-**Location:** `internal/scoring/score.go` (new function)
+### Implementation Plan
 
-**What:** Proper dew risk scoring using dew point spread:
+#### 1. Add profile data structures (`internal/config/profile.go` — new file)
 
 ```go
-func scoreHumidity(humidity, dewPoint, temperature float64) float64 {
-    spread := temperature - dewPoint
-    switch {
-    case spread > 10:
-        return 10  // very safe
-    case spread > 7:
-        return 8   // safe
-    case spread > 5:
-        return 6   // low risk
-    case spread > 3:
-        return 4   // moderate risk, mention in notes
-    case spread > 1.5:
-        return 2   // high risk, dew likely on unprotected optics
-    default:
-        return 0   // fogging almost certain
-    }
+type Profile struct {
+    Rigs []Rig `json:"rigs"`
+    Site Site  `json:"site"`
+}
+
+type Rig struct {
+    Name               string  `json:"name"`
+    Type               string  `json:"type"`
+    Camera             string  `json:"camera,omitempty"`
+    Tracked            bool    `json:"tracked"`
+    Lenses             []Lens  `json:"lenses,omitempty"`
+    ApertureMM         float64 `json:"aperture_mm,omitempty"`
+    FocalLengthMM      int     `json:"focal_length_mm,omitempty"`
+    SensorCropFactor   float64 `json:"sensor_crop_factor"`
+    IntegratedStacking bool    `json:"integrated_stacking,omitempty"`
+    MaxExposureSec     int     `json:"max_exposure_sec"`
+    FOVDegrees         float64 `json:"fov_degrees,omitempty"`
+}
+
+type Lens struct {
+    FocalLengthMM int     `json:"focal_length_mm"`
+    Aperture      float64 `json:"aperture"`
+    Name          string  `json:"name"`
+}
+
+type Site struct {
+    BortleClass         int      `json:"bortle_class"`
+    HorizonObstructions []string `json:"horizon_obstructions,omitempty"`
 }
 ```
 
-**Why:** Current code only uses humidity percentage, which is a rough proxy. Dew point spread directly predicts when condensation forms on optical surfaces that radiate heat to the sky (dropping 2-5C below ambient).
+Loader reads from `PROFILE_PATH` env var (default `./profile.json`). If the file does not exist, returns a hardcoded default matching the current behavior (Nikon D3500 untracked with two kit lenses).
 
-**Note:** We need temperature data. Open-Meteo has `temperature_2m` available -- just not currently requested.
+#### 2. Expand the target catalog (`internal/astro/targets.go`)
 
-### 8. Add Jet Stream Risk Warning
+- Add `MinFocalMM`, `MaxFocalMM`, `RequiresTracking`, `AngularSizeDeg` fields to the `Target` struct
+- Add the Seestar-class deep-sky targets from the table above
+- Backfill existing targets with their focal length constraints (all have min=18, max=300, no tracking required)
+- Remove hardcoded `Lens` and `Settings` strings from the catalog entries (replaced by dynamic generation)
 
-**Location:** `internal/scoring/score.go` (new field in Report)
+#### 3. New `TargetSuggestion` type and updated `SuggestTargets()` signature
 
-**What:** When `wind_speed_250hPa` > 30 m/s, add a warning flag that cirrus may develop or worsen even if current cloud cover looks clear. This does not directly penalize the score (models already predict the clouds) but adds a confidence/uncertainty note to the recommendation.
-
-### 9. Update NighttimeWeather Struct
-
-**Location:** `internal/weather/openmeteo.go`
-
-**New fields:**
 ```go
-type NighttimeWeather struct {
-    // ... existing fields ...
-    AvgTemperature       float64
-
-    // Pressure-level cloud profile (high atmosphere)
-    CloudCover300hPa     float64
-    CloudCover250hPa     float64
-    CloudCover200hPa     float64
-    CloudCover150hPa     float64
-    RH300hPa             float64
-    RH250hPa             float64
-    RH200hPa             float64
-    JetStreamSpeed       float64  // wind at 250 hPa, m/s
-
-    // ECMWF transparency data
-    AvgIWV               float64  // integrated water vapor, kg/m^2
-
-    // CAMS air quality
-    AvgAOD               float64  // aerosol optical depth at 550nm
+type TargetSuggestion struct {
+    Target   Target
+    Rig      string   // which rig to use
+    Settings string   // computed settings string
 }
+
+func SuggestTargets(month time.Month, moonIllumination float64, score float64, profile *config.Profile) []TargetSuggestion
 ```
 
-### 10. Update Report Struct
+Logic:
+- For each catalog target, check if any rig can reach it (focal length in range, tracking if required, FOV covers the angular size)
+- For untracked rigs: compute max exposure via rule of 500, format ISO/aperture settings
+- For smart telescopes: format as "10-30min integrated stack"
+- Return up to 5 suggestions, prioritizing by suitability score (matching FOV, conditions)
 
-**Location:** `internal/scoring/score.go`
+#### 4. Adjust scoring weights (`internal/scoring/score.go`)
 
-**New/modified fields:**
+Modify `Generate()` to accept the profile:
+
 ```go
-type Report struct {
-    // ... existing ...
-    CloudOpacity     string   // "Thin Cirrus", "Moderate", "Thick/Opaque"
-    TransparencyDesc string   // now based on physical data (IWV + AOD)
-    DewPointSpread   float64  // actual temp - dewpoint in C
-    DewRiskNote      string   // setup-specific: "No dew heater -- check lens every 15min"
-    JetStreamRisk    bool     // true when 250hPa wind > 30 m/s
-    IWV              float64  // for display
-    AOD              float64  // for display
-    Confidence       string   // "High" / "Moderate" / "Low" based on model agreement + jet stream
-
-    // Keep seeing for display but remove from score
-    Seeing     int
-    SeeingDesc string
-    SeeingNote string  // "Seeing does not affect wide-field imaging with your setup"
-}
+func Generate(wx *weather.NighttimeWeather, astroWx *weather.AstroConditions, moon *astro.MoonInfo, planets []astro.PlanetInfo, profile *config.Profile) *Report
 ```
 
-### 11. Update Discord Embed Display
+Weight selection:
+- If `profile.HasTrackedLongFL()` (any rig tracked with FL > 100mm):
+  - Cloud: 35%, Transparency: 20%, Seeing: 10%, Moon: 15%, Humidity: 10%, Wind: 5%, Precip: 5%
+- Otherwise (current behavior):
+  - Cloud: 40%, Transparency: 25%, Moon: 15%, Humidity: 10%, Wind: 5%, Precip: 5%
 
-**Location:** `internal/discord/webhook.go`
+Update `SeeingNote` dynamically based on whether seeing is scored.
 
-**Changes to `formatSkyConditions()`:**
-- Show cloud opacity estimate alongside coverage: "High: 95% (Thick -- 3 saturated levels)"
-- Show transparency source: "Transparency: Good (IWV: 12 kg/m^2, AOD: 0.04)"
-- Show dew point spread: "Dew Risk: Moderate (spread 3.5C) -- no heater, check lens every 15min"
-- Show jet stream warning when active
-- Show seeing as informational only with note it does not affect score
+#### 5. Update recommendations (`internal/scoring/score.go`)
 
-### 12. Update Weekly Quick Score
+`generateRecommendation()` gets access to the profile (via the Report struct or direct param):
+- Replace "wide-field imaging" with equipment-appropriate text
+- Reference specific equipment in dew/wind warnings
+- When Seestar is present and conditions are excellent, mention deep-sky stacking potential
 
-**Location:** `internal/weather/weekly.go`
+#### 6. Thread profile through `cmd/notify/main.go`
 
-**What:** `QuickScore()` currently uses the same broken 30% high cloud penalty. Update to use a more conservative default penalty. For the weekly forecast we will not have pressure-level data (too many API calls for 7 days), so:
-- Increase the base high cloud penalty from 0.3 to 0.7 (assume moderate opacity when thickness is unknown)
-- Add humidity into the weekly score as a transparency proxy
+- Load profile at startup (after config)
+- Pass to `scoring.Generate()` and `astro.SuggestTargets()`
+- Both the cron webhook and the `/forecast` slash command use it
 
-### 13. Add Temperature to Open-Meteo Request
+#### 7. Update Discord formatting (`internal/discord/webhook.go`)
 
-**Location:** `internal/weather/openmeteo.go`
+- `formatTargets()` now receives `[]astro.TargetSuggestion` and shows per-rig settings
+- Format example:
+  ```
+  - **Milky Way Core** : Galactic center rising in the south
+    D3500 @ 18mm: 15s, ISO 3200, f/3.5
+  - **Lagoon Nebula (M8)** : Bright emission nebula in Sagittarius
+    Seestar S30 Pro: 15-20min integrated stack
+  ```
 
-**What:** Add `temperature_2m` to the hourly parameters in the existing forecast URL. Needed for proper dew point spread calculation.
+#### 8. Docker compose + example files
 
----
-
-## Summary Table
-
-| # | File | Change | Priority |
-|---|---|---|---|
-| 1 | weather/openmeteo.go | Add pressure-level cloud + RH + jet stream fetch | High |
-| 2 | weather/openmeteo.go | Add ECMWF IWV fetch (new function) | High |
-| 3 | weather/openmeteo.go | Add CAMS AOD fetch (new function) | High |
-| 4 | scoring/score.go | Cloud opacity scoring with thickness estimate | High |
-| 5 | scoring/score.go | Physical transparency score (IWV + AOD) | High |
-| 6 | scoring/score.go | Reweight final score (remove seeing, add humidity/dew) | High |
-| 7 | scoring/score.go | Dew point spread scoring | Medium |
-| 8 | scoring/score.go | Jet stream risk flag | Medium |
-| 9 | weather/openmeteo.go | Expand NighttimeWeather struct | High |
-| 10 | scoring/score.go | Expand Report struct | High |
-| 11 | discord/webhook.go | Update embed display for new metrics | Medium |
-| 12 | weather/weekly.go | Fix QuickScore high cloud penalty | Medium |
-| 13 | weather/openmeteo.go | Add temperature_2m to request | High |
-
-**Dependency order:** 9, 13 -> 1, 2, 3 -> 4, 5, 7 -> 6, 8, 10 -> 11, 12
-
----
-
-## Recommended Implementation Order
-
-**Phase 1: Data layer** (changes 9, 13, 1, 2, 3)
-- Expand structs and API calls to fetch all new data
-- Existing scoring still works (new fields just unused initially)
-- Can test each API call independently
-
-**Phase 2: Scoring rework** (changes 4, 5, 6, 7, 8, 10)
-- Replace scoring functions
-- This is where the behavior change happens
-- Single commit so the transition is atomic
-
-**Phase 3: Display and weekly** (changes 11, 12)
-- Update Discord embed to show new data
-- Fix weekly quick score
-
----
+- Add volume mount: `./profile.json:/app/profile.json:ro`
+- Create `profile.example.json` with a reasonable default setup
+- Add `profile.json` to `.gitignore`
 
 ## Risks and Considerations
 
-1. **API rate limits** -- Three separate Open-Meteo calls per forecast (weather, ECMWF, air quality). Open-Meteo's free tier allows 10,000 calls/day. We make ~3 calls per forecast invocation, well within limits.
+- **Backward compatibility**: If no `profile.json` exists, the loader returns a default profile matching current behavior. Zero breaking changes for an existing deployment that doesn't add the file.
+- **Seestar FOV**: At 250mm f/5 with a ~1.3 degree FOV, M31 (3+ degrees) overflows the frame. Targets larger than the FOV should still be suggested (partial framing is valid for the Seestar's mosaic mode) but with a note.
+- **Scoring stability**: Adding seeing weight when a tracked rig is present means the same weather gives a slightly different score. Acceptable since the user's observing goals have expanded.
+- **Target count**: With two rigs, more targets match. The 5-target cap stays, but selection should prioritize variety (mix of DSLR and Seestar targets).
+- **Future lens additions**: User just adds a `{"focal_length_mm": 35, "aperture": 1.8, "name": "35mm f/1.8 prime"}` entry to the lenses array and targets matching that FL become available on next run.
 
-2. **ECMWF data availability** -- The ECMWF endpoint has slightly different temporal coverage than the standard forecast. May not always have data for tonight's exact window. Need graceful fallback (use neutral score).
+## Summary Table
 
-3. **AOD data gaps** -- CAMS air quality updates less frequently and coverage may vary. Need fallback to assumed-good (0.08) when unavailable.
-
-4. **Pressure-level data model availability** -- Not all Open-Meteo models expose pressure-level variables. Using `models=gfs_seamless` or `best_match` should work. Need to verify in integration testing.
-
-5. **Backward compatibility** -- The Report struct gains new fields. Discord embed formatting must handle zero-value fields gracefully (if a fetch fails, don't display garbage -- show "unavailable" or omit).
-
-6. **Validation scenario** -- After implementation, replay the bad-forecast case: 100% high cloud, thick cirrostratus. Expected result with new system: 3+ pressure levels saturated -> opacity factor ~0.9 -> high cloud penalty becomes (100% * 0.9) = 90% effective blockage -> cloud score drops to ~2.5/10 -> overall score becomes "Poor" or "Stay Inside". Matches reality.
-
----
+| # | Component | Change | Priority |
+|---|-----------|--------|----------|
+| 1 | `internal/config/profile.go` | New file: profile types + loader | High |
+| 2 | `internal/astro/targets.go` | Expand Target struct, add deep-sky catalog, profile-aware filtering | High |
+| 3 | `internal/scoring/score.go` | Accept profile, adjust weights for tracked rigs | High |
+| 4 | `cmd/notify/main.go` | Load profile, thread through calls | High |
+| 5 | `internal/discord/webhook.go` | Dynamic per-rig settings display | Medium |
+| 6 | `docker-compose.yml` | Volume mount for profile | Low |
+| 7 | `profile.example.json` | Example config shipped with repo | Low |
+| 8 | `.gitignore` | Add `profile.json` | Low |
 
 ## Code Comments Plan
 
-- `scoreCloudOpacity()`: Document that opacity factor 0.3/0.6/0.9 thresholds are derived from observed correlation between pressure-level saturation depth and visual sky quality
-- `estimateHighCloudOpacity()`: Document the three inputs (vertical extent, visibility, RH depth) and why each matters
-- `scoreTransparency()`: Document the IWV/AOD threshold sources (observational astronomy practice)
-- `scoreHumidity()`: Document that optical surfaces radiate 2-5C below ambient, making dew thresholds lower than standard meteorological expectations
-- Jet stream threshold: 30 m/s at 250 hPa correlates with cirrus generation from wind shear
+- `profile.go`: Comment explaining the fallback behavior when no profile file exists
+- `targets.go`: Comment on the `RequiresTracking`/`MinFocalMM` filtering logic and rule-of-500 computation
+- `score.go`: Comment explaining why weights shift when tracked equipment is present
+- `SuggestTargets()`: Comment explaining how targets are matched to rigs and settings are computed
 
 ---
 
-Planning document complete. Please review. I will proceed with implementation after your approval.
+Planning document complete. Please review. I'll proceed with implementation after your approval.

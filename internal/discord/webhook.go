@@ -8,8 +8,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/ldelossa/astro_weather_notify/internal/astro"
-	"github.com/ldelossa/astro_weather_notify/internal/scoring"
+	"github.com/lucasdelossantos/astro_weather_notify/internal/astro"
+	"github.com/lucasdelossantos/astro_weather_notify/internal/scoring"
 )
 
 type WebhookPayload struct {
@@ -96,10 +96,8 @@ func BuildEmbed(report *scoring.Report, locationName string) Embed {
 	}
 
 	if len(report.Targets) > 0 && report.Score >= 4 {
-		fields = append(fields, Field{
-			Name:  "Suggested Targets",
-			Value: formatTargets(report.Targets),
-		})
+		targetFields := formatTargetFields(report.Targets)
+		fields = append(fields, targetFields...)
 	}
 
 	if report.Moon != nil && report.Moon.Available {
@@ -205,13 +203,37 @@ func formatMoon(moon *astro.MoonInfo, impact string) string {
 	return s
 }
 
-func formatTargets(targets []astro.Target) string {
-	var s string
+// formatTargetFields splits targets across multiple embed fields to stay
+// within Discord's 1024-character limit per field value.
+func formatTargetFields(targets []astro.TargetSuggestion) []Field {
+	var fields []Field
+	var current string
+	fieldNum := 1
+
 	for _, t := range targets {
-		s += fmt.Sprintf("- **%s** : %s\n", t.Name, t.Description)
-		s += fmt.Sprintf("  Lens: %s | %s\n", t.Lens, t.Settings)
+		entry := fmt.Sprintf("- **%s** : %s\n  %s: %s\n", t.Target.Name, t.Target.Description, t.Rig, t.Settings)
+
+		if len(current)+len(entry) > 950 {
+			name := "Suggested Targets"
+			if fieldNum > 1 {
+				name = "Targets (cont.)"
+			}
+			fields = append(fields, Field{Name: name, Value: current})
+			current = ""
+			fieldNum++
+		}
+		current += entry
 	}
-	return s
+
+	if current != "" {
+		name := "Suggested Targets"
+		if fieldNum > 1 {
+			name = "Targets (cont.)"
+		}
+		fields = append(fields, Field{Name: name, Value: current})
+	}
+
+	return fields
 }
 
 func formatPlanets(planets []astro.PlanetInfo) string {
