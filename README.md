@@ -10,15 +10,18 @@ Every day at a configured time (default 4PM), sends a Discord embed with tonight
 - **Cloud thickness analysis** using pressure-level vertical profiles to distinguish thin cirrus from opaque cirrostratus
 - **Transparency forecast** from ECMWF integrated water vapor and CAMS aerosol optical depth
 - **Moon phase and impact** with rise/set times and twilight windows
-- **Visible planets** and suggested imaging targets for the season
+- **Visible planets** and equipment-matched target suggestions with computed camera settings
 - **Aurora alerts** when Kp index indicates northern lights potential
-- **Equipment-specific notes** (dew risk warnings for unprotected optics, jet stream cirrus advisories)
+- **Equipment-aware recommendations** tailored to your rigs (DSLR settings via rule-of-500, smart telescope stacking times)
+- **Notification threshold** -- daily notifications only fire when conditions are worth going out (configurable)
 
 Also provides interactive Discord slash commands for on-demand forecasts and weekly overviews.
 
 ## Scoring System
 
-The forecast score weights factors by their actual impact on wide-field astrophotography:
+The forecast score weights factors by their actual impact on astrophotography. Weights adapt to your equipment profile:
+
+**Untracked rigs only (wide-field DSLR):**
 
 | Factor | Weight | What It Measures |
 |--------|--------|------------------|
@@ -29,7 +32,21 @@ The forecast score weights factors by their actual impact on wide-field astropho
 | Wind | 5% | Tripod stability |
 | Precipitation | 5% | Equipment safety |
 
+**With tracked long-focal-length gear (e.g., Seestar S30 Pro):**
+
+| Factor | Weight | What It Measures |
+|--------|--------|------------------|
+| Cloud Opacity | 35% | Sky blockage with thickness-aware penalty |
+| Transparency | 20% | Atmospheric clarity |
+| Seeing | 10% | Atmospheric steadiness (matters at narrow FOV) |
+| Moon | 15% | Sky brightness from lunar illumination |
+| Humidity/Dew | 10% | Condensation risk on optics |
+| Wind | 5% | Mount stability |
+| Precipitation | 5% | Equipment safety |
+
 Cloud thickness is estimated by counting how many pressure levels (300, 250, 200, 150 hPa) show saturation. A single layer means thin cirrus (light penalty); three or more saturated levels means thick cirrostratus (treated as nearly opaque).
+
+The `/week` command uses the same full scoring pipeline (pressure-level data, IWV, AOD) as the nightly forecast for consistent scores, and highlights the best night of the week.
 
 ## Data Sources
 
@@ -58,7 +75,7 @@ When Open-Meteo returns a rate-limit error (429), the system automatically falls
 |---------|-------------|
 | `/forecast` | Tonight's detailed forecast (default location) |
 | `/forecast location:"Denver, CO"` | Forecast for a specific location |
-| `/week` | 7-night overview with scores |
+| `/week` | 7-night overview with full scores and best night highlighted |
 | `/events` | Astronomical events in the next 7 days |
 
 ## Setup
@@ -85,7 +102,54 @@ TIMEZONE=America/New_York
 LOCATION_NAME=Goshen, MA
 CRON_SCHEDULE=0 16 * * *               # 4PM daily
 TOMORROW_API_KEY=your-key              # optional, fallback weather source
+NOTIFY_THRESHOLD=6.0                   # minimum score to send daily notification (0-10)
 ```
+
+### Equipment Profile
+
+Copy `profile.example.json` to `profile.json` and customize for your gear:
+
+```json
+{
+  "rigs": [
+    {
+      "name": "Nikon D3500 (Untracked)",
+      "type": "untracked-dslr",
+      "camera": "Nikon D3500",
+      "tracked": false,
+      "lenses": [
+        {"focal_length_mm": 18, "aperture": 3.5, "name": "18-55mm kit (wide end)"},
+        {"focal_length_mm": 55, "aperture": 5.6, "name": "18-55mm kit (tele end)"}
+      ],
+      "max_exposure_sec": 25,
+      "sensor_crop_factor": 1.5
+    },
+    {
+      "name": "Seestar S30 Pro",
+      "type": "smart-telescope",
+      "tracked": true,
+      "aperture_mm": 50,
+      "focal_length_mm": 250,
+      "sensor_crop_factor": 1.0,
+      "integrated_stacking": true,
+      "max_exposure_sec": 600,
+      "fov_degrees": 1.3
+    }
+  ],
+  "site": {
+    "bortle_class": 4,
+    "horizon_obstructions": ["south-low-trees"]
+  }
+}
+```
+
+The profile drives:
+- **Target selection** -- only suggests targets your equipment can capture
+- **Camera settings** -- computed dynamically (rule-of-500 for untracked, stacking times for smart telescopes)
+- **Scoring weights** -- seeing becomes relevant when tracked long-FL gear is present
+- **Recommendations** -- text adapts to your specific rig capabilities
+
+To add a new lens, add a single entry to the `lenses` array and restart. If no `profile.json` exists, the bot falls back to default behavior (untracked DSLR with 18-55mm and 70-300mm kit lenses).
 
 ### Run Locally
 
@@ -100,7 +164,7 @@ go build -o astro-notify ./cmd/notify
 docker compose up -d
 ```
 
-The container runs continuously with a cron scheduler inside. It will send the daily webhook at the configured time and respond to slash commands.
+The container runs continuously with a cron scheduler inside. It will send the daily webhook at the configured time (only when conditions meet your threshold) and respond to slash commands. The `profile.json` is mounted as a read-only volume.
 
 ## Project Structure
 
@@ -111,7 +175,7 @@ internal/
     openmeteo.go            Open-Meteo forecast + pressure-level + ECMWF + CAMS
     tomorrow.go             Tomorrow.io fallback weather source
     seventimer.go           7Timer astronomical conditions
-    weekly.go               7-day nightly summaries
+    weekly.go               7-day nightly summaries (full scoring pipeline)
   scoring/
     score.go                Scoring engine with cloud opacity and transparency
   astro/
@@ -119,13 +183,16 @@ internal/
     planets.go              Visible planets
     events.go               Astronomical events calendar
     aurora.go               Aurora/Kp forecast
-    targets.go              Seasonal target suggestions
+    targets.go              Equipment-aware seasonal target suggestions
   discord/
     webhook.go              Discord embed formatting and sending
   geo/
     geocode.go              Location lookup
   config/
     config.go               Environment variable loading
+    profile.go              Equipment profile types and JSON loader
+profile.example.json        Example equipment profile
+profile.json                Your equipment profile (gitignored)
 ```
 
 ## How Cloud Opacity Works
